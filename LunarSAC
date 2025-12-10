@@ -1,0 +1,260 @@
+import os
+import gymnasium as gym
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import numpy as np
+from tqdm import tqdm
+import wandb
+
+
+# ============================================================
+# Replay Buffer
+# ============================================================
+class ReplayBuffer:
+    def __init__(self, obs_dim, act_dim, size):
+        self.obs_buf = np.zeros((size, obs_dim), dtype=np.float32)
+        self.next_obs_buf = np.zeros((size, obs_dim), dtype=np.float32)
+        self.acts_buf = np.zeros((size, act_dim), dtype=np.float32)
+        self.rews_buf = np.zeros(size, dtype=np.float32)
+        self.done_buf = np.zeros(size, dtype=np.float32)
+        self.ptr = 0
+        self.size = size
+        self.full = False
+
+    def store(self, obs, act, rew, next_obs, done):
+        self.obs_buf[self.ptr] = obs
+        self.acts_buf[self.ptr] = act
+        self.rews_buf[self.ptr] = rew
+        self.next_obs_buf[self.ptr] = next_obs
+        self.done_buf[self.ptr] = done
+
+        self.ptr += 1
+        if self.ptr >= self.size:
+            self.ptr = 0
+            self.full = True
+
+    def sample(self, batch_size):
+        max_idx = self.size if self.full else self.ptr
+        idx = np.random.randint(0, max_idx, size=batch_size)
+
+        return {
+            "obs": torch.tensor(self.obs_buf[idx], dtype=torch.float32),
+            "acts": torch.tensor(self.acts_buf[idx], dtype=torch.float32),
+            "rews": torch.tensor(self.rews_buf[idx], dtype=torch.float32).unsqueeze(1),
+            "next_obs": torch.tensor(self.next_obs_buf[idx], dtype=torch.float32),
+            "done": torch.tensor(self.done_buf[idx], dtype=torch.float32).unsqueeze(1),
+        }
+
+
+# ============================================================
+# SAC AGENT
+# ============================================================
+class SAC:
+    # -------------------------------------------
+    # Minimal MLP inside the SAC class
+    # -------------------------------------------
+    class MLP(nn.Module):
+        def __init__(self, inp, out):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Linear(inp, 256),
+                nn.ReLU(),
+                nn.Linear(256, 256),
+                nn.ReLU(),
+                nn.Linear(256, out),
+            )
+
+        def forward(self, x):
+            return self.net(x)
+
+    # -------------------------------------------
+
+    def __init__(self, obs_dim, act_dim, act_limit, lr=3e-4, alpha=0.2):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.act_dim = act_dim
+        self.act_limit = act_limit
+
+        self.gamma = 0.99
+        self.tau = 0.005
+        self.alpha = alpha
+
+        # Critics
+        self.q1 = SAC.MLP(obs_dim + act_dim, 1).to(self.device)
+        self.q2 = SAC.MLP(obs_dim + act_dim, 1).to(self.device)
+        self.q1_targ = SAC.MLP(obs_dim + act_dim, 1).to(self.device)
+        self.q2_targ = SAC.MLP(obs_dim + act_dim, 1).to(self.device)
+
+        self.q1_targ.load_state_dict(self.q1.state_dict())
+        self.q2_targ.load_state_dict(self.q2.state_dict())
+
+        # Actor
+        self.actor = SAC.MLP(obs_dim, act_dim * 2).to(self.device)
+
+        # Optimizers
+        self.q_opt = optim.Adam(
+            list(self.q1.parameters()) + list(self.q2.parameters()), lr=lr
+        )
+        self.actor_opt = optim.Adam(self.actor.parameters(), lr=lr)
+
+    # --------------------------------------------------------
+
+    def _policy(self, obs):
+        out = self.actor(obs)
+        mu, log_std = out[:, :self.act_dim], out[:, self.act_dim:]
+        std = torch.exp(log_std.clamp(-20, 2))
+
+        dist = torch.distributions.Normal(mu, std)
+        u = dist.rsample()  # Reparameterization
+        a = torch.tanh(u)
+
+        # log-prob with tanh correction
+        logp = dist.log_prob(u).sum(axis=1, keepdim=True)
+        correction = (2 * (np.log(2) - u - F.softplus(-2 * u))).sum(
+            axis=1, keepdim=True
+        )
+        logp -= correction
+
+        return self.act_limit * a, logp
+
+    # --------------------------------------------------------
+
+    def select_action(self, obs, deterministic=False):
+        obs = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+        out = self.actor(obs)
+        mu = out[:, :self.act_dim]
+
+        if deterministic:
+            a = torch.tanh(mu)
+            return (a * self.act_limit).cpu().numpy()[0]
+        else:
+            a, _ = self._policy(obs)
+            return a.cpu().numpy()[0]
+
+    # --------------------------------------------------------
+
+    def train(self, buf, batch_size=256):
+        data = buf.sample(batch_size)
+        obs = data["obs"].to(self.device)
+        acts = data["acts"].to(self.device)
+        rews = data["rews"].to(self.device)
+        next_obs = data["next_obs"].to(self.device)
+        done = data["done"].to(self.device)
+
+        # ---------------------------
+        # Update critic
+        # ---------------------------
+        with torch.no_grad():
+            next_a, next_logp = self._policy(next_obs)
+
+            q1_next = self.q1_targ(torch.cat([next_obs, next_a], dim=1))
+            q2_next = self.q2_targ(torch.cat([next_obs, next_a], dim=1))
+            min_q_next = torch.min(q1_next, q2_next)
+
+            target_q = rews + self.gamma * (1 - done) * (min_q_next - self.alpha * next_logp)
+
+        q1_pred = self.q1(torch.cat([obs, acts], dim=1))
+        q2_pred = self.q2(torch.cat([obs, acts], dim=1))
+
+        q_loss = F.mse_loss(q1_pred, target_q) + F.mse_loss(q2_pred, target_q)
+
+        self.q_opt.zero_grad()
+        q_loss.backward()
+        self.q_opt.step()
+
+        # ---------------------------
+        # Update actor
+        # ---------------------------
+        a_new, logp_new = self._policy(obs)
+        q1_pi = self.q1(torch.cat([obs, a_new], dim=1))
+        q2_pi = self.q2(torch.cat([obs, a_new], dim=1))
+        min_q_pi = torch.min(q1_pi, q2_pi)
+
+        actor_loss = (self.alpha * logp_new - min_q_pi).mean()
+
+        self.actor_opt.zero_grad()
+        actor_loss.backward()
+        self.actor_opt.step()
+
+        # ---------------------------
+        # Soft update
+        # ---------------------------
+        with torch.no_grad():
+            for p, p_targ in zip(self.q1.parameters(), self.q1_targ.parameters()):
+                p_targ.data.mul_(1 - self.tau)
+                p_targ.data.add_(self.tau * p.data)
+
+            for p, p_targ in zip(self.q2.parameters(), self.q2_targ.parameters()):
+                p_targ.data.mul_(1 - self.tau)
+                p_targ.data.add_(self.tau * p.data)
+
+
+# ============================================================
+# TRAIN LOOP
+# ============================================================
+def train_agent(env_name="LunarLander-v3", steps=300000):
+    wandb.init(project="SAC-Training", config={"env": env_name}, reinit=True)
+
+    env = gym.make(env_name, continuous=True, render_mode="rgb_array")
+
+    env = gym.wrappers.RecordVideo(
+        env,
+        video_folder="./video_recordings",
+        episode_trigger=lambda eid: eid % 50 == 0,
+        name_prefix="sac-video",
+    )
+
+    obs_dim = env.observation_space.shape[0]
+    act_dim = env.action_space.shape[0]
+    act_limit = float(env.action_space.high[0])
+
+    agent = SAC(obs_dim, act_dim, act_limit)
+    buf = ReplayBuffer(obs_dim, act_dim, size=int(1e6))
+
+    obs, _ = env.reset()
+    ep_ret = 0
+    best_score = -float("inf")
+
+    print("🚀 Training SAC...")
+
+    for t in tqdm(range(steps)):
+        # Warmup
+        if t < 5000:
+            act = env.action_space.sample()
+        else:
+            act = agent.select_action(obs)
+
+        next_obs, rew, terminated, truncated, _ = env.step(act)
+        done = terminated or truncated
+
+        buf.store(obs, act, rew, next_obs, done)
+
+        if t >= 5000:
+            agent.train(buf)
+
+        obs = next_obs
+        ep_ret += rew
+
+        # Episode end
+        if done:
+            wandb.log({"episode_reward": ep_ret, "global_step": t})
+
+            if ep_ret > best_score:
+                best_score = ep_ret
+                os.makedirs("saved_models", exist_ok=True)
+                torch.save(agent.actor.state_dict(), f"saved_models/SAC_best.pth")
+                print(f"🌟 New Best Score: {best_score:.2f}")
+
+            obs, _ = env.reset()
+            ep_ret = 0
+
+    wandb.finish()
+    return agent
+
+
+# ============================================================
+# RUN TRAINING
+# ============================================================
+if __name__ == "__main__":
+    sac_agent = train_agent("LunarLander-v3", steps=300000)
