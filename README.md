@@ -6,27 +6,15 @@ This repository contains implementations of State-of-the-Art (SOTA) model-free R
 
 ## 📌 Assignment Overview
 
-[cite_start]The objective of this assignment is to solve **continuous control** problems using three specific algorithms[cite: 4, 9]:
+The objective of this assignment is to solve **continuous control** problems using three specific algorithms:
 1.  **SAC** (Soft Actor-Critic)
 2.  **PPO** (Proximal Policy Optimization)
 3.  **TD3** (Twin Delayed DDPG)
 
 ### Environments
-[cite_start]The agents are trained on the following Gymnasium Box2D environments[cite: 11, 12, 13]:
+The agents are trained on the following Gymnasium Box2D environments:
 * `LunarLander-v3` (`continuous=True`)
 * `CarRacing-v3` (`continuous=True`)
 
-## 📂 Repository Structure
 
-Based on the current development branch:
 
-* **`LunarPPO/`**: Implementation of the PPO agent specifically tuned for the continuous LunarLander environment.
-* **`LunarSAC/`**: Implementation of the SAC agent.
-* **`TD3 LUNAR and SAC.ipynb`**: Jupyter Notebook containing the training logic and experiments for TD3 and SAC models.
-
-## 🛠️ Dependencies & Installation
-
-[cite_start]To run the codes, you need to install the following Python libraries[cite: 7, 8]:
-
-```bash
-pip install gymnasium[box2d] torch wandb huggingface_hub
