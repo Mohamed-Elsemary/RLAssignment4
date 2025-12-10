@@ -1,0 +1,498 @@
+"""
+PPO for continuous LunarLander-v3 (Gymnasium) with:
+- Tanh-squashed Gaussian policy
+- Weights & Biases (wandb) logging
+- Progress bar with "🌟 New Best Score: ..." messages
+- Video recording every 100 episodes into PPO_videos (configurable)
+- Action-noise annealing, critic enlarge, reward scaling during training,
+  advantage normalization/clamping, LR decay, entropy annealing.
+Requirements:
+    pip install gymnasium[box2d] torch tqdm wandb
+    (and have a wandb account: run `wandb login` once)
+"""
+
+import os
+import math
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions import Normal
+from tqdm.auto import tqdm
+import gymnasium as gym
+from gymnasium.wrappers import RecordVideo
+import wandb
+from typing import Tuple, Optional
+
+# -------------------------
+# Utility: MLP
+# -------------------------
+def mlp(input_dim, hidden_sizes, output_dim, activation=nn.Tanh, output_activation=None):
+    layers = []
+    last_dim = input_dim
+    for h in hidden_sizes:
+        layers.append(nn.Linear(last_dim, h))
+        layers.append(activation())
+        last_dim = h
+    layers.append(nn.Linear(last_dim, output_dim))
+    if output_activation is not None:
+        layers.append(output_activation())
+    return nn.Sequential(*layers)
+
+
+# ============================================================
+# PPO agent (tanh-squashed Gaussian policy)
+# ============================================================
+class PPOContinuous(nn.Module):
+    def __init__(
+        self,
+        obs_dim: int,
+        act_dim: int,
+        actor_hidden=(256, 256),
+        critic_hidden=(400, 300),
+        lr: float = 3e-4,
+        device: Optional[torch.device] = None,
+        log_std_init: float = -0.5,
+        ent_coef_start: float = 0.02,
+        ent_coef_final: float = 0.005,
+    ):
+        super().__init__()
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # actor mean network
+        self.actor_mean = mlp(obs_dim, actor_hidden, act_dim)
+        # state-independent log std (learnable)
+        self.actor_log_std = nn.Parameter(torch.ones(act_dim) * log_std_init)
+
+        # critic network (larger)
+        self.critic = mlp(obs_dim, critic_hidden, 1)
+
+        # entropy coefficient schedule (we keep copies and update in training loop)
+        self.ent_coef_start = ent_coef_start
+        self.ent_coef_final = ent_coef_final
+        self.ent_coef = ent_coef_start
+
+        self.to(self.device)
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=lr, eps=1e-5)
+
+    def get_dist(self, obs_tensor: torch.Tensor) -> Normal:
+        mean = self.actor_mean(obs_tensor)
+        log_std = self.actor_log_std.expand_as(mean)
+        std = torch.exp(log_std)
+        return Normal(mean, std)
+
+    @torch.no_grad()
+    def act(self, obs_np: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float, float]:
+        obs = torch.as_tensor(obs_np, dtype=torch.float32, device=self.device).unsqueeze(0)
+        dist = self.get_dist(obs)
+        pre_tanh = dist.rsample()                     # reparameterized sample
+        action = torch.tanh(pre_tanh)
+        # log prob with tanh correction
+        log_prob = dist.log_prob(pre_tanh)
+        log_prob = log_prob - torch.log(1 - action.pow(2) + 1e-6)
+        log_prob = log_prob.sum(-1)
+        value = self.critic(obs).squeeze(-1)
+        return (
+            action.squeeze(0).cpu().numpy(),            # in [-1,1]
+            pre_tanh.squeeze(0).cpu().numpy(),
+            float(log_prob.cpu().item()),
+            float(value.cpu().item()),
+        )
+
+    def evaluate_actions(self, obs_tensor: torch.Tensor, pre_tanh_action_tensor: torch.Tensor):
+        dist = self.get_dist(obs_tensor)
+        action = torch.tanh(pre_tanh_action_tensor)
+        log_prob = dist.log_prob(pre_tanh_action_tensor)
+        log_prob = log_prob - torch.log(1 - action.pow(2) + 1e-6)
+        log_prob = log_prob.sum(-1)
+        entropy = dist.entropy().sum(-1)
+        values = self.critic(obs_tensor).squeeze(-1)
+        return log_prob, entropy, values
+
+    def set_action_noise(self, frac: float, min_log_std: float = -2.5, max_log_std: float = -0.5):
+        """
+        Anneal actor_log_std from max_log_std (early) to min_log_std (late).
+        frac: 1 -> 0 over training (1 at start, 0 at end).
+        """
+        new_log_std = max_log_std * frac + min_log_std * (1.0 - frac)
+        with torch.no_grad():
+            self.actor_log_std.data = torch.ones_like(self.actor_log_std) * new_log_std
+
+    def set_entropy_coef(self, frac: float):
+        """Set entropy coefficient as linear interpolation between start and final."""
+        self.ent_coef = self.ent_coef_final + (self.ent_coef_start - self.ent_coef_final) * frac
+
+
+# ============================================================
+# GAE computation
+# ============================================================
+def compute_gae(rewards, values, dones, last_value, gamma, gae_lambda):
+    """
+    rewards, values, dones: numpy arrays length T
+    last_value: scalar
+    returns: advantages, returns (both numpy arrays)
+    """
+    T = len(rewards)
+    advantages = np.zeros(T, dtype=np.float32)
+    gae = 0.0
+    for t in reversed(range(T)):
+        next_value = last_value if t == T - 1 else values[t + 1]
+        nonterminal = 1.0 - dones[t]
+        delta = rewards[t] + gamma * next_value * nonterminal - values[t]
+        gae = delta + gamma * gae_lambda * nonterminal * gae
+        advantages[t] = gae
+    returns = advantages + values
+    return advantages, returns
+
+
+# ============================================================
+# Training loop
+# ============================================================
+def train_ppo_continuous(
+    env: gym.Env,
+    total_timesteps: int = 600_000,
+    steps_per_update: int = 8192,
+    update_epochs: int = 20,
+    minibatch_size: int = 256,
+    lr: float = 3e-4,
+    gamma: float = 0.99,
+    gae_lambda: float = 0.95,
+    clip_coef: float = 0.2,
+    ent_coef_start: float = 0.02,
+    ent_coef_final: float = 0.005,
+    vf_coef: float = 0.5,
+    max_grad_norm: float = 0.5,
+    reward_scale: float = 1/100.0,   # scale rewards during training
+    seed: int = 0,
+    video_folder: str = "PPO_videos_precise",
+    log_to_wandb: bool = True,
+):
+    """
+    Trains PPO with the improvements for precise landings.
+    - reward_scale: multiply rewards by this factor during training only.
+    - agent.set_action_noise(frac) will be called each step; frac=1 at start -> 0 at end.
+    """
+
+    obs_dim = env.observation_space.shape[0]
+    act_dim = env.action_space.shape[0]
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    agent = PPOContinuous(
+        obs_dim=obs_dim,
+        act_dim=act_dim,
+        actor_hidden=(256, 256),
+        critic_hidden=(400, 300),
+        lr=lr,
+        device=device,
+        log_std_init=-0.5,
+        ent_coef_start=ent_coef_start,
+        ent_coef_final=ent_coef_final,
+    )
+
+    # seeds
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    try:
+        env.reset(seed=seed)
+        env.action_space.seed(seed)
+    except TypeError:
+        env.seed(seed)
+        env.action_space.seed(seed)
+
+    obs, _ = env.reset()
+    ep_return_real = 0.0     # real (unscaled) episode return for logging
+    ep_return_scaled = 0.0   # scaled return used for training
+    episode = 0
+    best_score = -np.inf
+    global_step = 0
+
+    pbar = tqdm(total=total_timesteps, desc="Training PPO", unit="step")
+    # main loop
+    while global_step < total_timesteps:
+        # buffers
+        batch_obs = np.zeros((steps_per_update, obs_dim), dtype=np.float32)
+        batch_pre_tanh = np.zeros((steps_per_update, act_dim), dtype=np.float32)
+        batch_log_probs = np.zeros(steps_per_update, dtype=np.float32)
+        batch_rewards = np.zeros(steps_per_update, dtype=np.float32)
+        batch_rewards_real = np.zeros(steps_per_update, dtype=np.float32)  # keep raw rewards for logging if needed
+        batch_dones = np.zeros(steps_per_update, dtype=np.float32)
+        batch_values = np.zeros(steps_per_update, dtype=np.float32)
+
+        for step in range(steps_per_update):
+            batch_obs[step] = obs
+
+            action, pre_tanh_action, log_prob, value = agent.act(obs)
+
+            batch_pre_tanh[step] = pre_tanh_action
+            batch_log_probs[step] = log_prob
+            batch_values[step] = value
+
+            next_obs, reward, terminated, truncated, info = env.step(action)
+            done = bool(terminated or truncated)
+
+            # Keep real reward for logging & record scaled reward for training
+            batch_rewards_real[step] = reward
+            reward_scaled = reward * reward_scale
+            batch_rewards[step] = reward_scaled
+            batch_dones[step] = float(done)
+
+            ep_return_real += reward
+            ep_return_scaled += reward_scaled
+
+            global_step += 1
+            pbar.update(1)
+
+            # Action-noise & entropy annealing
+            frac = 1.0 - (global_step / float(total_timesteps))
+            frac = float(np.clip(frac, 0.0, 1.0))
+            agent.set_action_noise(frac)
+            agent.set_entropy_coef(frac)
+            # adjust learning rate linearly
+            lr_now = lr * (1.0 - (global_step / float(total_timesteps)))
+            for param_group in agent.optimizer.param_groups:
+                param_group["lr"] = lr_now
+
+            if done:
+                # Logging episode returns
+                if log_to_wandb:
+                    wandb.log(
+                        {
+                            "train/episode_return_real": ep_return_real,
+                            "train/episode_return_scaled": ep_return_scaled,
+                            "train/global_step": global_step,
+                        },
+                        step=global_step,
+                    )
+
+                # New best?
+                if ep_return_real > best_score:
+                    best_score = ep_return_real
+                    msg = f"🌟 New Best Score: {best_score:.2f} at step {global_step}"
+                    pbar.set_postfix_str(msg)
+                    if log_to_wandb:
+                        wandb.log({"train/best_score": best_score, "train/global_step": global_step}, step=global_step)
+
+                ep_return_real = 0.0
+                ep_return_scaled = 0.0
+                episode += 1
+                obs, _ = env.reset()
+            else:
+                obs = next_obs
+
+            if global_step >= total_timesteps:
+                break
+
+        actual_batch_size = step + 1
+
+        # bootstrap last value (critic predicts value on current obs)
+        with torch.no_grad():
+            obs_tensor_last = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+            last_value = float(agent.critic(obs_tensor_last).cpu().item()) * reward_scale  # scale critic target to training scale
+
+        rewards = batch_rewards[:actual_batch_size]        # SCALED rewards
+        values = batch_values[:actual_batch_size]         # values are from critic (unscaled): we must scale them for GAE to match reward scale
+        values = values * reward_scale
+        dones = batch_dones[:actual_batch_size]
+
+        advantages, returns = compute_gae(rewards, values, dones, last_value, gamma=gamma, gae_lambda=gae_lambda)
+
+        # Convert to tensors
+        obs_tensor = torch.as_tensor(batch_obs[:actual_batch_size], dtype=torch.float32, device=device)
+        pre_tanh_tensor = torch.as_tensor(batch_pre_tanh[:actual_batch_size], dtype=torch.float32, device=device)
+        old_log_probs_tensor = torch.as_tensor(batch_log_probs[:actual_batch_size], dtype=torch.float32, device=device)
+        advantages_tensor = torch.as_tensor(advantages, dtype=torch.float32, device=device)
+        returns_tensor = torch.as_tensor(returns, dtype=torch.float32, device=device)
+
+        # Normalization (std-only) and clamp advantages
+        adv_std = advantages_tensor.std() + 1e-8
+        advantages_tensor = advantages_tensor / adv_std
+        advantages_tensor = torch.clamp(advantages_tensor, -4.0, 4.0)
+
+        # PPO updates: multiple epochs, minibatches
+        batch_indices = np.arange(actual_batch_size)
+        last_policy_loss = last_value_loss = last_entropy_mean = None
+
+        for _ in range(update_epochs):
+            np.random.shuffle(batch_indices)
+            for start in range(0, actual_batch_size, minibatch_size):
+                end = start + minibatch_size
+                mb_idx = batch_indices[start:end]
+
+                mb_obs = obs_tensor[mb_idx]
+                mb_pre_tanh = pre_tanh_tensor[mb_idx]
+                mb_old_log_probs = old_log_probs_tensor[mb_idx]
+                mb_advantages = advantages_tensor[mb_idx]
+                mb_returns = returns_tensor[mb_idx]
+
+                new_log_probs, entropy, values_pred = agent.evaluate_actions(mb_obs, mb_pre_tanh)
+
+                # values_pred are unscaled; scale them to the same scale as returns for loss
+                values_pred_scaled = values_pred * reward_scale
+
+                ratio = torch.exp(new_log_probs - mb_old_log_probs)
+
+                surr1 = ratio * mb_advantages
+                surr2 = torch.clamp(ratio, 1.0 - clip_coef, 1.0 + clip_coef) * mb_advantages
+                policy_loss = -torch.min(surr1, surr2).mean()
+
+                value_loss = F.mse_loss(values_pred_scaled, mb_returns)
+
+                entropy_loss = -entropy.mean()  # negative so adding ent_coef * entropy_loss reduces objective
+
+                loss = policy_loss + vf_coef * value_loss + agent.ent_coef * entropy_loss
+
+                agent.optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(agent.parameters(), max_grad_norm)
+                agent.optimizer.step()
+
+                last_policy_loss = policy_loss.detach().cpu().item()
+                last_value_loss = value_loss.detach().cpu().item()
+                last_entropy_mean = float(entropy.detach().mean().cpu().item())
+
+        # Log updates
+        if log_to_wandb and last_policy_loss is not None:
+            wandb.log(
+                {
+                    "loss/policy": last_policy_loss,
+                    "loss/value": last_value_loss,
+                    "stats/entropy": last_entropy_mean,
+                    "train/global_step": global_step,
+                    "train/learning_rate": agent.optimizer.param_groups[0]["lr"],
+                    "train/ent_coef": agent.ent_coef,
+                },
+                step=global_step,
+            )
+
+    pbar.close()
+    return agent
+
+
+# ============================================================
+# Environment creator with RecordVideo (every 100 episodes)
+# ============================================================
+def make_lunarlander_env_with_video(video_dir="PPO_videos_precise"):
+    os.makedirs(video_dir, exist_ok=True)
+
+    def video_trigger(episode_id: int) -> bool:
+        # record episodes 100, 200, ...
+        return (episode_id + 1) % 100 == 0
+
+    base_env = gym.make("LunarLander-v3", continuous=True, render_mode="rgb_array")
+    env = RecordVideo(
+        base_env,
+        video_folder=video_dir,
+        episode_trigger=video_trigger,
+        disable_logger=True,
+    )
+    return env
+
+
+# ============================================================
+# Deterministic evaluation (no scaling, raw returns)
+# ============================================================
+def evaluate_policy(env: gym.Env, agent: PPOContinuous, episodes: int = 10):
+    device = agent.device
+    returns = []
+    for _ in range(episodes):
+        obs, _ = env.reset()
+        done = False
+        ep_ret = 0.0
+        while not done:
+            obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=device)
+            with torch.no_grad():
+                mean = agent.actor_mean(obs_tensor.unsqueeze(0))
+            action = torch.tanh(mean).squeeze(0).cpu().numpy()
+            obs, reward, terminated, truncated, _ = env.step(action)
+            ep_ret += reward
+            done = bool(terminated or truncated)
+        returns.append(ep_ret)
+    return float(np.mean(returns)), float(np.std(returns))
+
+
+# ============================================================
+# Main
+# ============================================================
+if __name__ == "__main__":
+    # ==== Config ====
+    TOTAL_TIMESTEPS = 600_000
+    STEPS_PER_UPDATE = 8192
+    UPDATE_EPOCHS = 20
+    MINIBATCH = 256
+    LR = 3e-4
+    GAMMA = 0.99
+    GAE_LAMBDA = 0.95
+    CLIP = 0.2
+    ENT_COEF_START = 0.02
+    ENT_COEF_FINAL = 0.005
+    VF_COEF = 0.5
+    MAX_GRAD_NORM = 0.5
+    REWARD_SCALE = 1.0 / 100.0   # training-time scaling
+    SEED = 0
+    VIDEO_DIR = "PPOvideos_precise"
+    LOG_TO_WANDB = True
+    PROJECT = "PPO-LunarLander-Precise"
+    RUN_NAME = "ppo_precise_600k"
+
+    # env
+    env = make_lunarlander_env_with_video(video_dir=VIDEO_DIR)
+
+    # W&B
+    if LOG_TO_WANDB:
+        wandb.init(
+            project=PROJECT,
+            name=RUN_NAME,
+            config={
+                "total_timesteps": TOTAL_TIMESTEPS,
+                "steps_per_update": STEPS_PER_UPDATE,
+                "update_epochs": UPDATE_EPOCHS,
+                "minibatch_size": MINIBATCH,
+                "lr": LR,
+                "gamma": GAMMA,
+                "gae_lambda": GAE_LAMBDA,
+                "clip_coef": CLIP,
+                "ent_coef_start": ENT_COEF_START,
+                "ent_coef_final": ENT_COEF_FINAL,
+                "vf_coef": VF_COEF,
+                "max_grad_norm": MAX_GRAD_NORM,
+                "reward_scale": REWARD_SCALE,
+                "seed": SEED,
+            },
+        )
+
+    agent = train_ppo_continuous(
+        env=env,
+        total_timesteps=TOTAL_TIMESTEPS,
+        steps_per_update=STEPS_PER_UPDATE,
+        update_epochs=UPDATE_EPOCHS,
+        minibatch_size=MINIBATCH,
+        lr=LR,
+        gamma=GAMMA,
+        gae_lambda=GAE_LAMBDA,
+        clip_coef=CLIP,
+        ent_coef_start=ENT_COEF_START,
+        ent_coef_final=ENT_COEF_FINAL,
+        vf_coef=VF_COEF,
+        max_grad_norm=MAX_GRAD_NORM,
+        reward_scale=REWARD_SCALE,
+        seed=SEED,
+        video_folder=VIDEO_DIR,
+        log_to_wandb=LOG_TO_WANDB,
+    )
+
+    os.makedirs("models", exist_ok=True)
+    model_path = "models/ppo_lunarlander_precise.pth"
+    torch.save(agent.state_dict(), model_path)
+    print(f"Model saved to {model_path}")
+    if LOG_TO_WANDB:
+        wandb.save(model_path)
+
+    # evaluate deterministically (no scaling)
+    eval_env = gym.make("LunarLander-v3", continuous=True)
+    mean_ret, std_ret = evaluate_policy(eval_env, agent, episodes=10)
+    print(f"Evaluation over 10 episodes: mean return = {mean_ret:.2f} ± {std_ret:.2f}")
+    if LOG_TO_WANDB:
+        wandb.log({"eval/mean_return": mean_ret, "eval/std_return": std_ret})
+    wandb.finish()
+    env.close()
+    eval_env.close()
