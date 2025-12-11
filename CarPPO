@@ -1,0 +1,317 @@
+"""
+CarRacing-v3 PPO (continuous) with:
+- CNN encoder + MLP actor/critic
+- Frame stacking (4)
+- Reward shaping (grass penalty + asphalt bonus)
+- Action smoothing for stable driving
+- WandB logging
+- Video recording every 20 episodes
+- Best score printed on tqdm bar
+- LR decay, entropy annealing, advantage normalization
+- Stable PPO settings for pixel-control environments
+"""
+
+import os
+import cv2
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions import Normal
+from tqdm.auto import tqdm
+import gymnasium as gym
+from gymnasium.wrappers import RecordVideo
+import wandb
+
+# ============================================================
+# 1. OBS PREPROCESSING: grayscale, resize, stack 4 frames
+# ============================================================
+class CarRacingPreprocess:
+    def __init__(self, shape=(84, 84), stack=4):
+        self.shape = shape
+        self.stack = stack
+        self.frames = None
+
+    def reset(self, obs):
+        obs = self._process(obs)
+        self.frames = [obs for _ in range(self.stack)]
+        return np.stack(self.frames, axis=0)
+
+    def step(self, obs):
+        obs = self._process(obs)
+        self.frames.pop(0)
+        self.frames.append(obs)
+        return np.stack(self.frames, axis=0)
+
+    def _process(self, obs):
+        gray = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
+        resized = cv2.resize(gray, self.shape, interpolation=cv2.INTER_AREA)
+        normalized = resized.astype(np.float32) / 255.0
+        return normalized
+
+# ============================================================
+# 2. CNN Encoder
+# ============================================================
+class CNNEncoder(nn.Module):
+    def __init__(self, in_channels=4):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, 32, 8, stride=4),  # 84 → 20
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 4, stride=2),           # 20 → 9
+            nn.ReLU(),
+            nn.Conv2d(64, 64, 3, stride=1),           # 9 → 7
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+        self.fc = nn.Linear(64*7*7, 512)
+
+    def forward(self, x):
+        x = self.net(x)
+        x = F.relu(self.fc(x))
+        return x
+
+# ============================================================
+# 3. PPO Actor-Critic
+# ============================================================
+class PPO_CarRacing(nn.Module):
+    def __init__(self, act_dim=3, lr=3e-4, ent_start=0.02, ent_end=0.005, log_std_init=-0.5, device=None):
+        super().__init__()
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.encoder = CNNEncoder(in_channels=4)
+        self.actor_mean = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, act_dim),
+        )
+        self.actor_log_std = nn.Parameter(torch.ones(act_dim) * log_std_init)
+
+        self.critic = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1),
+        )
+
+        self.ent_start = ent_start
+        self.ent_end = ent_end
+        self.ent_coef = ent_start
+
+        self.to(self.device)
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=lr, eps=1e-5)
+
+    def encode(self, obs):
+        return self.encoder(obs)
+
+    def get_dist(self, feat):
+        mean = self.actor_mean(feat)
+        log_std = self.actor_log_std.expand_as(mean)
+        std = torch.exp(log_std)
+        return Normal(mean, std)
+
+    @torch.no_grad()
+    def act(self, obs_np):
+        obs = torch.as_tensor(obs_np, dtype=torch.float32, device=self.device).unsqueeze(0)
+        feat = self.encode(obs)
+        dist = self.get_dist(feat)
+        pre_tanh = dist.rsample()
+        action = torch.tanh(pre_tanh)
+        logp = dist.log_prob(pre_tanh) - torch.log(1 - action.pow(2) + 1e-6)
+        return (
+            action.squeeze(0).cpu().numpy(),
+            pre_tanh.squeeze(0).cpu().numpy(),
+            logp.sum(-1).cpu().item(),
+            self.critic(feat).squeeze(0).cpu().item()
+        )
+
+    def evaluate(self, obs_tensor, pre_tanh_tensor):
+        feat = self.encode(obs_tensor)
+        dist = self.get_dist(feat)
+        action = torch.tanh(pre_tanh_tensor)
+        logp = dist.log_prob(pre_tanh_tensor) - torch.log(1 - action.pow(2) + 1e-6)
+        entropy = dist.entropy().sum(-1)
+        v = self.critic(feat).squeeze(-1)
+        return logp.sum(-1), entropy, v
+
+    def set_entropy(self, frac):
+        self.ent_coef = self.ent_end + (self.ent_start - self.ent_end) * frac
+
+    def set_log_std(self, frac, low=-2.5, high=-0.5):
+        val = high * frac + low * (1 - frac)
+        with torch.no_grad():
+            self.actor_log_std.data.fill_(val)
+
+# ============================================================
+# 4. GAE
+# ============================================================
+def compute_gae(rewards, values, dones, last_val, gamma=0.99, lam=0.95):
+    T = len(rewards)
+    adv = np.zeros(T, dtype=np.float32)
+    gae = 0.0
+    for t in reversed(range(T)):
+        nv = last_val if t == T-1 else values[t+1]
+        delta = rewards[t] + gamma * (1-dones[t]) * nv - values[t]
+        gae = delta + gamma * lam * (1-dones[t]) * gae
+        adv[t] = gae
+    return adv, adv + values
+
+# ============================================================
+# 5. TRAIN PPO
+# ============================================================
+def train_car_racing(
+    env,
+    total_steps=1_500_000,
+    steps_per_update=16384,
+    update_epochs=10,
+    minibatch=512,
+    lr=3e-4,
+    gamma=0.99,
+    lam=0.95,
+    clip=0.2,
+    reward_scale=0.01,
+):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    agent = PPO_CarRacing(act_dim=3, lr=lr, device=device)
+    preprocess = CarRacingPreprocess()
+    obs, _ = env.reset()
+    stacked = preprocess.reset(obs)
+
+    best_score = -np.inf
+    global_step = 0
+    ep_ret = 0
+    prev_action = np.zeros(3, dtype=np.float32)
+
+    pbar = tqdm(total=total_steps, desc="PPO-CarRacing", unit="step")
+
+    while global_step < total_steps:
+        B = steps_per_update
+        obs_buf = np.zeros((B, 4, 84, 84), np.float32)
+        pre_buf = np.zeros((B, 3), np.float32)
+        logp_buf = np.zeros(B, np.float32)
+        rew_buf = np.zeros(B, np.float32)
+        done_buf = np.zeros(B, np.float32)
+        val_buf = np.zeros(B, np.float32)
+
+        for t in range(B):
+            obs_buf[t] = stacked
+
+            # ---------------- ACTION & SMOOTHING ----------------
+            action_raw, pre, logp, value = agent.act(stacked)
+            alpha = max(0.5, 0.9 - 0.4*(global_step/total_steps))
+            action = alpha * prev_action + (1-alpha) * action_raw
+            prev_action = action.copy()
+
+            pre_buf[t] = pre
+            logp_buf[t] = logp
+            val_buf[t] = value
+
+            next_obs, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+
+            # ---------------- REWARD SHAPING ----------------
+            rgb = next_obs
+            green = rgb[:,:,1]
+            grass_ratio = (green>160).mean()
+            brightness = rgb.mean()
+            r = reward
+            if grass_ratio>0.05:
+                r -= 0.2 * (grass_ratio*20)
+            if brightness<90:
+                r += 0.05
+            rew_buf[t] = r * reward_scale
+            ep_ret += reward
+
+            global_step += 1
+            pbar.update(1)
+
+            # Entropy & log_std annealing
+            frac = 1 - global_step/total_steps
+            agent.set_entropy(frac)
+            agent.set_log_std(frac)
+
+            if done:
+                if ep_ret > best_score:
+                    best_score = ep_ret
+                    pbar.set_postfix_str(f"🌟 New Best Score: {best_score:.1f}")
+                if wandb.run is not None:
+                    wandb.log({"ep_return": ep_ret}, step=global_step)
+                ep_ret = 0
+                obs, _ = env.reset()
+                stacked = preprocess.reset(obs)
+                prev_action[:] = 0
+            else:
+                stacked = preprocess.step(next_obs)
+
+            if global_step >= total_steps:
+                break
+
+        # ---------------- BOOTSTRAP ----------------
+        with torch.no_grad():
+            last_val = agent.act(stacked)[3]*reward_scale
+        adv, ret = compute_gae(rew_buf, val_buf*reward_scale, done_buf, last_val, gamma, lam)
+
+        # Convert to tensors
+        obs_t = torch.tensor(obs_buf, dtype=torch.float32, device=device)
+        pre_t = torch.tensor(pre_buf, dtype=torch.float32, device=device)
+        old_logp_t = torch.tensor(logp_buf, dtype=torch.float32, device=device)
+        adv_t = torch.tensor(adv, dtype=torch.float32, device=device)
+        ret_t = torch.tensor(ret, dtype=torch.float32, device=device)
+
+        adv_t = (adv_t - adv_t.mean())/(adv_t.std()+1e-8)
+
+        # PPO update
+        idxs = np.arange(len(obs_t))
+        for _ in range(update_epochs):
+            np.random.shuffle(idxs)
+            for start in range(0, len(idxs), minibatch):
+                end = start+minibatch
+                mb = idxs[start:end]
+
+                logp_new, entropy, values = agent.evaluate(obs_t[mb], pre_t[mb])
+                ratio = torch.exp(logp_new - old_logp_t[mb])
+                s1 = ratio*adv_t[mb]
+                s2 = torch.clamp(ratio,1-clip,1+clip)*adv_t[mb]
+                pi_loss = -torch.min(s1,s2).mean()
+
+                v_loss = F.mse_loss(values*reward_scale, ret_t[mb])
+                ent_loss = -entropy.mean()
+                loss = pi_loss + 0.5*v_loss + agent.ent_coef*ent_loss
+
+                agent.optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(agent.parameters(), 0.5)
+                agent.optimizer.step()
+
+    pbar.close()
+    return agent
+
+# ============================================================
+# 6. ENV WITH VIDEO
+# ============================================================
+def make_car_env(video_dir="CarPPO_videos"):
+    os.makedirs(video_dir, exist_ok=True)
+    def trig(ep): return (ep+1)%20==0
+    base = gym.make("CarRacing-v3", continuous=True, render_mode="rgb_array")
+    env = RecordVideo(base, video_folder=video_dir, episode_trigger=trig)
+    return env
+
+# ============================================================
+# MAIN
+# ============================================================
+if __name__=="__main__":
+    wandb.init(project="PPO-CarRacing", name="ppo_pixel_1_5M")
+
+    env = make_car_env()
+    agent = train_car_racing(
+        env,
+        total_steps=1_500_000,
+        steps_per_update=16384,
+        update_epochs=10,
+        minibatch=512,
+        lr=3e-4,
+    )
+
+    torch.save(agent.state_dict(), "ppo_car_racing.pth")
+    wandb.save("ppo_car_racing.pth")
+    print("Model saved!")
+    env.close()
